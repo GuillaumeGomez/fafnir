@@ -19,6 +19,10 @@ fn init_tests(
     populate_tables(&conn);
     load_poi_class_function(&conn);
     load_osm_id_function(&conn);
+    load_osm_hash_from_imposm_function(&conn);
+    load_global_id_from_imposm_function(&conn);
+    load_poi_class_rank_function(&conn);
+    load_layer_poi_function(&conn);
     load_es_data(es_wrapper, country_code);
 }
 
@@ -180,6 +184,138 @@ fn load_osm_id_function(conn: &Connection) {
                 END
             );
         $$ LANGUAGE SQL IMMUTABLE;
+    ",
+        &[],
+    )
+    .unwrap();
+}
+
+fn load_layer_poi_function(conn: &Connection) {
+    conn.execute(
+        r#"
+        CREATE OR REPLACE FUNCTION layer_poi(bbox geometry, zoom_level integer, pixel_width numeric)
+RETURNS TABLE(osm_id bigint, global_id text, geometry geometry, name text, name_en text, name_de text, tags hstore, class text, subclass text, agg_stop integer, layer integer, level integer, indoor integer, "rank" int, mapping_key text) AS $$
+    SELECT osm_id_hash AS osm_id, global_id,
+        geometry, NULLIF(name, '') AS name,
+        COALESCE(NULLIF(name_en, ''), name) AS name_en,
+        COALESCE(NULLIF(name_de, ''), name, name_en) AS name_de,
+        tags,
+        poi_class(subclass, mapping_key) AS class,
+        CASE
+            WHEN subclass = 'information'
+                THEN NULLIF(information, '')
+            WHEN subclass = 'place_of_worship'
+                THEN NULLIF(religion, '')
+            WHEN subclass = 'pitch'
+                THEN NULLIF(sport, '')
+            ELSE subclass
+        END AS subclass,
+        agg_stop,
+        NULLIF(layer, 0) AS layer,
+        "level",
+        CASE WHEN indoor=TRUE THEN 1 ELSE NULL END as indoor,
+        row_number() OVER (
+            PARTITION BY LabelGrid(geometry, 100 * pixel_width)
+            ORDER BY CASE WHEN name = '' THEN 2000 ELSE poi_class_rank(poi_class(subclass, mapping_key)) END ASC
+        )::int AS "rank"
+    FROM (
+        -- etldoc: osm_poi_point ->  layer_poi:z12
+        -- etldoc: osm_poi_point ->  layer_poi:z13
+        SELECT *,
+            osm_hash_from_imposm(osm_id) AS osm_id_hash,
+            global_id_from_imposm(osm_id) as global_id
+        FROM osm_poi_point
+            WHERE CASE WHEN bbox IS NULL THEN TRUE ELSE geometry && bbox END
+                AND zoom_level BETWEEN 12 AND 13
+                AND ((subclass='station' AND mapping_key = 'railway')
+                    OR subclass IN ('halt', 'ferry_terminal'))
+        UNION ALL
+
+        -- etldoc: osm_poi_point ->  layer_poi:z14_
+        SELECT *,
+            osm_hash_from_imposm(osm_id) AS osm_id_hash,
+            global_id_from_imposm(osm_id) as global_id
+        FROM osm_poi_point
+            WHERE CASE WHEN bbox IS NULL THEN TRUE ELSE geometry && bbox END
+                AND zoom_level >= 14
+                AND (name <> '' OR (subclass <> 'garden' AND subclass <> 'park'))
+
+        UNION ALL
+        -- etldoc: osm_poi_polygon ->  layer_poi:z12
+        -- etldoc: osm_poi_polygon ->  layer_poi:z13
+        SELECT *,
+            NULL::INTEGER AS agg_stop,
+            osm_hash_from_imposm(osm_id) AS osm_id_hash,
+            global_id_from_imposm(osm_id) as global_id
+        FROM osm_poi_polygon
+            WHERE CASE WHEN bbox IS NULL THEN TRUE ELSE geometry && bbox END
+                AND zoom_level BETWEEN 12 AND 13
+                AND ((subclass='station' AND mapping_key = 'railway')
+                    OR subclass IN ('halt', 'ferry_terminal'))
+
+        UNION ALL
+        -- etldoc: osm_poi_polygon ->  layer_poi:z14_
+        SELECT *,
+            NULL::INTEGER AS agg_stop,
+            osm_hash_from_imposm(osm_id) AS osm_id_hash,
+            global_id_from_imposm(osm_id) as global_id
+        FROM osm_poi_polygon
+            WHERE CASE WHEN bbox IS NULL THEN TRUE ELSE geometry && bbox END
+                AND zoom_level >= 14
+                AND (name <> '' OR (subclass <> 'garden' AND subclass <> 'park'))
+        ) as poi_union
+    ORDER BY "rank"
+    ;
+$$ LANGUAGE SQL IMMUTABLE;
+"#,
+        &[],
+    )
+    .unwrap();
+}
+
+fn load_poi_class_rank_function(conn: &Connection) {
+    conn.execute(
+        "
+        CREATE OR REPLACE FUNCTION poi_class_rank(imposm_id bigint)
+            RETURNS INTEGER AS $$
+            SELECT 42;
+        $$ LANGUAGE SQL IMMUTABLE;
+    ",
+        &[],
+    )
+    .unwrap();
+}
+
+fn load_osm_hash_from_imposm_function(conn: &Connection) {
+    conn.execute(
+        "
+CREATE OR REPLACE FUNCTION osm_hash_from_imposm(imposm_id bigint)
+RETURNS bigint AS $$
+    SELECT CASE
+        WHEN imposm_id < -1e17 THEN (-imposm_id-1e17) * 10 + 4 -- Relation
+        WHEN imposm_id < 0 THEN  (-imposm_id) * 10 + 1 -- Way
+        ELSE imposm_id * 10 -- Node
+    END::bigint;
+$$ LANGUAGE SQL IMMUTABLE;
+    ",
+        &[],
+    )
+    .unwrap();
+}
+
+fn load_global_id_from_imposm_function(conn: &Connection) {
+    conn.execute(
+        "
+CREATE OR REPLACE FUNCTION global_id_from_imposm(imposm_id bigint)
+RETURNS TEXT AS $$
+    SELECT CONCAT(
+        'osm:',
+        CASE WHEN imposm_id < -1e17 THEN CONCAT('relation:', -imposm_id-1e17)
+             WHEN imposm_id < 0 THEN CONCAT('way:', -imposm_id)
+             ELSE CONCAT('node:', imposm_id)
+        END
+    );
+$$ LANGUAGE SQL IMMUTABLE;
     ",
         &[],
     )
